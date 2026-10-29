@@ -1,0 +1,22 @@
+# Claves y credenciales: nunca se suben
+.env
+credenciales_google.json
+*.pem
+
+# Datos locales del bot
+bot.db
+bot.db-*
+fotos/
+salida/
+*.log
+
+# Entorno y temporales
+venv/
+.venv/
+__pycache__/
+*.pyc
+.claude/
+
+# Copias de seguridad y pruebas
+respaldo_*/
+_prueba/
