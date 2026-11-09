@@ -99,18 +99,10 @@ def _decimales(moneda: str) -> int:
 def cuenta_info() -> dict:
     """Datos de la cuenta publicitaria y de la Página/Instagram vinculados."""
     c = _api("GET", _cuenta(), fields="name,currency,account_status,amount_spent,spend_cap,timezone_name")
+    # Sin Página de Facebook: el anuncio sale directo desde la cuenta de Instagram (conectada a la cuenta
+    # publicitaria en el portfolio comercial). Si hay una Página indicada, se usa además.
     pagina = _env("META_PAGE_ID") or db.obtener_ajuste("promo_page_id")
-    ig = db.obtener_ajuste("promo_ig_id")
-    if not pagina or not ig:
-        paginas = _api("GET", "me/accounts", fields="id,name,instagram_business_account{id,username}").get("data", [])
-        elegida = next((p for p in paginas if (p.get("instagram_business_account") or {}).get("username", "").casefold()
-                        == config.INSTAGRAM_USERNAME), None)
-        if not elegida:
-            raise ErrorPublicidad(f"No encontré una Página de Facebook vinculada a @{config.INSTAGRAM_USERNAME}. "
-                                  "Vinculala desde Instagram → Configuración → Centro de cuentas, o desde la Página.")
-        pagina, ig = elegida["id"], elegida["instagram_business_account"]["id"]
-        db.guardar_ajuste("promo_page_id", pagina)
-        db.guardar_ajuste("promo_ig_id", ig)
+    ig = _env("META_IG_ID") or db.obtener_ajuste("promo_ig_id") or config.IG_USER_ID()
     estados = {1: "activa", 2: "deshabilitada", 3: "con pagos pendientes", 7: "en revisión", 9: "en período de gracia",
                101: "cerrada"}
     return {"nombre": c.get("name"), "moneda": c.get("currency", "ARS"), "estado": estados.get(c.get("account_status"),
@@ -144,8 +136,38 @@ def _segmentacion() -> dict:
             item.update(radius=int(z["radio"]), distance_unit="kilometer")
         geo.setdefault(destino, []).append(item)
     geo["location_types"] = ["home", "recent"]
-    return {"geo_locations": geo, "age_min": 18, "publisher_platforms": ["instagram"],
-            "instagram_positions": ["stream", "story", "explore", "reels"]}
+    ubicaciones = [u.strip() for u in _env("PROMO_UBICACIONES", "story").split(",") if u.strip()]
+    seg = {"geo_locations": geo, "age_min": _edad("PROMO_EDAD_MIN", 30), "age_max": _edad("PROMO_EDAD_MAX", 65),
+           "publisher_platforms": ["instagram"], "instagram_positions": ubicaciones or ["story"],
+           "targeting_automation": {"advantage_audience": 0}}  # respeta zonas e intereses al pie de la letra
+    if intereses():
+        seg["flexible_spec"] = [{"interests": [{"id": i["id"], "name": i["nombre"]} for i in intereses()]}]
+    return seg
+
+
+def _edad(nombre: str, defecto: int) -> int:
+    try:
+        return min(65, max(18, int(_env(nombre, str(defecto)))))
+    except ValueError:
+        return defecto
+
+
+def intereses() -> list[dict]:
+    try:
+        return json.loads(db.obtener_ajuste("promo_intereses", "[]"))
+    except ValueError:
+        return []
+
+
+def guardar_intereses(lista: list[dict]) -> None:
+    db.guardar_ajuste("promo_intereses", json.dumps(lista, ensure_ascii=False))
+
+
+def buscar_intereses(texto: str) -> list[dict]:
+    """Intereses de Meta (ej: diseño de interiores, arquitectura, artículos de lujo) con su tamaño de público."""
+    datos = _api("GET", "search", type="adinterest", q=texto, limit=10, locale="es_LA").get("data", [])
+    return [{"id": d["id"], "nombre": d.get("name"), "publico": d.get("audience_size_upper_bound"),
+             "ruta": " › ".join(d.get("path") or [])} for d in datos]
 
 
 # ---------- Fechas y montos del mes ----------
@@ -176,10 +198,12 @@ def posts_promocionados() -> list[dict]:
 
 # ---------- Armado de la campaña del mes ----------
 def _crear_anuncio(info: dict, adset_id: str, media_id: str, nombre: str) -> tuple[str, str]:
-    cta = ({"type": "INSTAGRAM_MESSAGE", "value": {"app_destination": "INSTAGRAM_DIRECT"}}
+    cta = ({"type": "INSTAGRAM_MESSAGE", "value": {"app_destination": "INSTAGRAM_DIRECT",
+                                                   "link": f"https://www.instagram.com/{config.INSTAGRAM_USERNAME}/"}}
            if objetivo() == "mensajes" else None)
-    params = {"name": f"Post {media_id}", "object_id": info["page_id"], "instagram_user_id": info["ig_id"],
-              "source_instagram_media_id": media_id}
+    params = {"name": f"Post {media_id}", "instagram_user_id": info["ig_id"], "source_instagram_media_id": media_id}
+    if info["page_id"]:
+        params["object_id"] = info["page_id"]
     if cta:
         params["call_to_action"] = cta
     creativo = _api("POST", f"{_cuenta()}/adcreatives", **params)["id"]
@@ -197,7 +221,7 @@ def _borrar(*ids: str) -> None:
                 pass
 
 
-def crear_mes() -> str:
+def crear_mes(activar: bool = True) -> str:
     """Crea la campaña del mes con el presupuesto proporcional y las publicaciones elegidas. Devuelve el mensaje."""
     if _fila_mes():
         return "La campaña de este mes ya existe."
@@ -211,7 +235,13 @@ def crear_mes() -> str:
     if not info["estado_ok"]:
         raise ErrorPublicidad(f"La cuenta publicitaria está {info['estado']}. Revisala en el Administrador de anuncios.")
     ahora = datetime.now(config.ZONA)
-    total = int(round(monto * _proporcion(ahora)))
+    # El presupuesto entero se usa desde el día de inicio (5 de cada mes) durante los días que alcance con el
+    # mínimo diario que exige Meta; el mes siguiente se crea una campaña nueva.
+    if ahora.day < dia_inicio():
+        raise ErrorPublicidad(f"La campaña del mes arranca el día {dia_inicio()}.")
+    total = monto
+    dias = max(1, min(int(total // minimo_diario()), (_fin_de_mes(ahora) - ahora).days + 1))
+    fin = min(_fin_de_mes(ahora), (ahora + timedelta(days=dias)).replace(hour=23, minute=59, second=0, microsecond=0))
     nombre_mes = ahora.strftime("%m/%Y")
     creados = []
     try:
@@ -222,12 +252,13 @@ def crear_mes() -> str:
         creados.append(campana)
         adset = {"name": f"Presupuesto {nombre_mes}", "campaign_id": campana,
                  "lifetime_budget": total * _decimales(info["moneda"]),
-                 "start_time": (ahora + timedelta(minutes=5)).isoformat(), "end_time": _fin_de_mes(ahora).isoformat(),
+                 "start_time": (ahora + timedelta(minutes=5)).isoformat(), "end_time": fin.isoformat(),
                  "billing_event": "IMPRESSIONS", "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
                  "targeting": _segmentacion(), "status": "PAUSED"}
         if objetivo() == "mensajes":
-            adset.update(optimization_goal="CONVERSATIONS", destination_type="INSTAGRAM_DIRECT",
-                         promoted_object={"page_id": info["page_id"]})
+            adset.update(optimization_goal="CONVERSATIONS", destination_type="INSTAGRAM_DIRECT")
+            if info["page_id"]:
+                adset["promoted_object"] = {"page_id": info["page_id"]}
         else:
             adset.update(optimization_goal="REACH")
         adset_id = _api("POST", f"{_cuenta()}/adsets", **adset)["id"]
@@ -240,7 +271,8 @@ def crear_mes() -> str:
         for _, _, anuncio in anuncios:
             _api("POST", anuncio, status="ACTIVE")
         _api("POST", adset_id, status="ACTIVE")
-        _api("POST", campana, status="ACTIVE")
+        if activar:  # con activar=False queda todo listo pero la campaña en pausa: no gasta hasta reanudarla
+            _api("POST", campana, status="ACTIVE")
     except ErrorPublicidad:
         _borrar(*reversed(creados))  # nada queda a medias gastando plata
         raise
@@ -251,8 +283,23 @@ def crear_mes() -> str:
             con.execute("UPDATE promo_posts SET ad_id=?, creative_id=?, mes=?, error=NULL WHERE media_id=?",
                         (anuncio, creativo, _mes(ahora), media_id))
     monto_txt = f"{total:,}".replace(",", ".")
-    return (f"Campaña de {nombre_mes} activa: {monto_txt} {info['moneda']} en total hasta el "
-            f"{_fin_de_mes(ahora):%d/%m}, con {len(anuncios)} publicación(es).")
+    return (f"Campaña de {nombre_mes} {'activa' if activar else 'creada en pausa'}: {monto_txt} {info['moneda']} "
+            f"en total hasta el {fin:%d/%m}, con {len(anuncios)} publicación(es).")
+
+
+def dia_inicio() -> int:
+    try:
+        return min(28, max(1, int(_env("PROMO_DIA_INICIO", "5"))))
+    except ValueError:
+        return 5
+
+
+def minimo_diario() -> float:
+    """Lo mínimo por día que Meta acepta para estos anuncios (con margen); define cuántos días dura la campaña."""
+    try:
+        return max(1.0, float(_env("PROMO_MINIMO_DIARIO", "1650")))
+    except ValueError:
+        return 1650.0
 
 
 # ---------- Cambios desde el panel ----------
@@ -354,7 +401,23 @@ def mantener() -> str | None:
     if not (configurada() and activa()):
         return None
     aviso = None
-    if not _fila_mes() and any(p["activo"] for p in posts_promocionados()) and presupuesto_mensual() > 0:
+    if (not _fila_mes() and datetime.now(config.ZONA).day >= dia_inicio()
+            and any(p["activo"] for p in posts_promocionados()) and presupuesto_mensual() > 0):
         aviso = "📣 " + crear_mes()
     gasto_del_mes()
-    return aviso
+    return aviso or _aviso_token()
+
+
+def _aviso_token() -> str | None:
+    """Una vez por día, si al token de anuncios le quedan 7 días o menos, avisa para renovarlo."""
+    hoy = datetime.now(config.ZONA).date().isoformat()
+    if db.obtener_ajuste("promo_token_revisado") == hoy:
+        return None
+    db.guardar_ajuste("promo_token_revisado", hoy)
+    token = _env("META_ADS_TOKEN")
+    datos = _api("GET", "debug_token", input_token=token).get("data", {})
+    vence = datos.get("expires_at") or 0
+    if vence and (datetime.fromtimestamp(vence, config.ZONA) - datetime.now(config.ZONA)).days <= 7:
+        return (f"⚠️ El permiso de publicidad vence el {datetime.fromtimestamp(vence, config.ZONA):%d/%m}. "
+                "Pedile a Claude que lo renueve para que la campaña no se corte.")
+    return None

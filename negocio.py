@@ -81,7 +81,7 @@ def numero(texto):
     return float(m.group().replace(",", ".")) if m else None
 
 
-CLAVES_SERVICIO = (("hidro", "Pulido e hidrolaqueado"), ("plastific", "Pulido y plastificado"),
+CLAVES_SERVICIO = (("manten", "Mantenimiento"), ("otra mano", "Mantenimiento"), ("hidro","Pulido e hidrolaqueado"), ("plastific", "Pulido y plastificado"),
                    ("deck", "Decks"), ("zocalo", "Colocación de zócalos"), ("escaler", "Escaleras"),
                    ("coloca", "Colocación de piso"), ("repar", "Reparaciones"), ("pulid", "pulido"),
                    ("pulir", "pulido"), ("pulan", "pulido"))

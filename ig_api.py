@@ -147,7 +147,7 @@ def publicar_imagen(image_url: str, caption: str = "", historia: bool = False) -
 # ---------- Mensajes directos ----------
 def conversaciones_recientes(limite: int = 20) -> list[dict]:
     datos = _llamar("GET", f"{config.ID_MENSAJES()}/conversations", platform="instagram", limit=limite,
-                    fields="id,messages.limit(3){id,message,from,created_time}")
+                    fields="id,messages.limit(8){id,message,from,created_time}")
     return datos.get("data", [])
 
 

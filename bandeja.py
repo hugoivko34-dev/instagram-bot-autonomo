@@ -1,4 +1,6 @@
 """Bandeja de mensajes: clasifica cada DM, responde lo simple y te deriva lo importante."""
+import re
+
 import requests
 
 import config
@@ -23,19 +25,30 @@ Respondé corto, máximo 3 oraciones. Nunca inventes precios, plazos ni datos qu
 Usá esta información del negocio:
 {contexto}
 
-Leé toda la conversación; los m² pueden aparecer en un mensaje anterior.
+Leé toda la conversación (los m² pueden aparecer en un mensaje anterior), pero clasificá y respondé SOLO el ÚLTIMO mensaje del cliente. Si ya se le pasó un presupuesto y ahora hace otra pregunta, la intención es "pregunta", no "cotizar".
+Si la conversación ya empezó, no saludes de nuevo (nada de "¡Hola!"). No ofrezcas una visita si ya se ofreció antes en la conversación. No supongas un servicio que el cliente no nombró.
 Devolvé SOLO este JSON con todas las claves: {{"intencion":"cotizar|visita|derivar|pregunta|saludo|importante","servicio":"nombre exacto de la lista o pulido o cadena vacía","terminacion":"o cadena vacía","m2": número o null,"respuesta":"...","resumen":"una línea para el dueño"}}.
 - cotizar: pide precio de un servicio cotizable. Si pregunta por pulido sin indicar hidrolaqueado o plastificado, servicio debe ser pulido. Si faltan m², preguntá cuántos aproximados son y si quiere brillante, satinado o mate, y ofrecé coordinar una visita.
 - visita: prefiere que vayamos a ver o medir.
 - derivar: servicio no cotizable (colocaciones, escaleras, reparaciones) o consulta fuera de la información.
 - pregunta: duda respondible con la información y las preguntas frecuentes.
 - saludo: saludo o agradecimiento; respondé breve y preguntá en qué podés ayudar.
-- importante: reclamo, cliente con trabajo en curso, proveedor o propuesta; respuesta vacía."""
+- importante: reclamo, queja, insulto, acusación o comentario negativo sobre el negocio o el equipo; cliente con trabajo en curso; proveedor, propuesta comercial, búsqueda de trabajo u otra empresa; pedido de datos personales de alguien del equipo; mensaje raro o fuera de tema. Respuesta vacía: lo atiende el dueño."""
+
+
+_PARA_EL_DUENO = re.compile(
+    r"ladr|estaf|chorr|roban|robar|drog|caca|mierda|pelotud|boludo|forro|trucho|denunc|"
+    r"busc\w* (personal|trabajo|empleo)|necesit\w* personal|\bpersonal\b\s*\?|empleo|curricul|\bcv\b")
 
 
 def _analizar_local(historial: str, texto_cliente: str = "") -> dict:
     datos = {"intencion": "importante", "servicio": "", "terminacion": "", "m2": None,
              "respuesta": "", "resumen": ""}
+    lineas = historial.splitlines()
+    ultimo_cliente = next((l.split(":", 1)[1] for l in reversed(lineas) if l.lower().startswith("cliente:")), "")
+    if _PARA_EL_DUENO.search(negocio._normalizar(ultimo_cliente)):  # insultos, acusaciones, búsquedas de trabajo
+        return {"intencion": "importante", "servicio": "", "m2": None,
+                "categoria": "importante", "respuesta": "", "aviso": ""}
     try:
         contexto = negocio.contexto()
         prompt = SISTEMA_LOCAL.format(nombre=negocio._datos.get("Nombre del negocio", "el negocio"),
@@ -54,9 +67,23 @@ def _analizar_local(historial: str, texto_cliente: str = "") -> dict:
         if det_servicio and (det_servicio != "pulido" or not servicio):
             servicio = det_servicio
         terminacion = det_terminacion or str(r.get("terminacion") or "")
-        m2 = det_m2 or negocio.numero(r.get("m2"))
+        # los m² tienen que salir de lo que escribió el cliente: la IA a veces los inventa
+        m2 = det_m2
+        if intencion == "derivar":  # texto fijo y solo con el servicio que el cliente nombró en su último mensaje
+            nombrado = negocio.detectar(ultimo_cliente)[0]
+            if nombrado and nombrado != "pulido":
+                servicio = nombrado
+                r["respuesta"] = f"{servicio} lo cotizamos personalmente, así te pasamos un precio justo."
+            else:
+                servicio = ""
+                r["respuesta"] = "Esa consulta te la responde alguien del equipo."
+        if any(l.lower().startswith("yo:") for l in lineas):  # conversación empezada: sin "¡Hola!" de nuevo
+            r["respuesta"] = re.sub(r"^\s*¡?hola[!.,]*\s*", "", str(r.get("respuesta") or ""), flags=re.I)
+            r["respuesta"] = r["respuesta"][:1].upper() + r["respuesta"][1:]
+        if any(l.lower().startswith("yo:") and "aproximado es" in l for l in lineas) or "aproximado es" in historial:
+            m2 = negocio.detectar(ultimo_cliente)[2]  # ya se cotizó: solo se recotiza si el cliente da m² nuevos
         cot = None
-        if intencion not in {"visita", "importante"} and servicio and m2 and m2 > 0:
+        if intencion in {"cotizar", "derivar"} and servicio and m2 and m2 > 0:
             cot = negocio.cotizar(servicio, terminacion, m2)
             if cot:
                 intencion = "cotizar"
@@ -66,7 +93,8 @@ def _analizar_local(historial: str, texto_cliente: str = "") -> dict:
                 r["respuesta"] = str(r.get("respuesta") or "").replace(n, "").replace(":  ", ": ")
         if intencion == "cotizar" and m2 and m2 > 0:
             if cot:
-                respuesta = cot + "\n\n¿Querés que coordinemos una visita para confirmarlo?"
+                respuesta = cot + ("" if "coordinemos una visita" in historial
+                                   else "\n\n¿Querés que coordinemos una visita para confirmarlo?")
                 categoria = "interes_compra"
             else:
                 intencion, categoria = "derivar", "interes_compra"
@@ -140,6 +168,15 @@ def _parece_compra(texto: str) -> bool:
     return any(p in t for p in PALABRAS_COMPRA)
 
 
+def _viejo(mensaje: dict, horas: int = 23) -> bool:
+    from datetime import datetime, timedelta, timezone
+    try:
+        enviado = datetime.fromisoformat(mensaje["created_time"].replace("+0000", "+00:00"))
+    except (KeyError, ValueError):
+        return False
+    return datetime.now(timezone.utc) - enviado > timedelta(hours=horas)
+
+
 def _pide_borrado(texto: str) -> bool:
     t = negocio._normalizar(texto)
     return "borrar mis datos" in t or "delete my data" in t
@@ -178,6 +215,12 @@ def procesar() -> dict:
             continue
         usuario = ultimo["from"]["id"]
         texto = ultimo.get("message", "")
+
+        if _viejo(ultimo):  # Instagram solo deja responder dentro de las 24 h: los viejos se marcan como vistos
+            with db.conexion() as con:
+                con.execute("INSERT OR IGNORE INTO mensajes (ig_msg_id, ig_usuario_id, texto, categoria, respuesta, estado) "
+                            "VALUES (?,?,?,?,?,?)", (ultimo["id"], usuario, texto, "importante", "", "vencido"))
+            continue
 
         if _pide_borrado(texto):
             borrar_usuario(usuario, ultimo["id"])
