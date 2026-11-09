@@ -20,3 +20,6 @@ __pycache__/
 # Copias de seguridad y pruebas
 respaldo_*/
 _prueba/
+
+# Datos y precios del negocio (privados)
+negocio.xlsx

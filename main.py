@@ -130,6 +130,7 @@ def correr():
                 ultima_sync = hoy
             paso("token", renovar_token_si_toca)
             paso("excel", exportar.exportar)  # métricas para Power BI en salida/metricas_instagram.xlsx
+            paso("privacidad", bandeja.borrar_antiguos)  # los mensajes se guardan 12 meses como máximo
         hora = datetime.now(config.ZONA).strftime("%Y-%m-%d %H")
         if ultima_publicidad != hora:  # una vez por hora: campaña del mes y gasto
             ultima_publicidad = hora
@@ -180,7 +181,16 @@ def main():
     s.add_parser("excel", help="sincroniza métricas y genera salida/metricas_instagram.xlsx para Power BI")
     ib = s.add_parser("importar", help="agrega al banco las fotos de una carpeta, sin moverlas")
     ib.add_argument("carpeta")
+    pr = s.add_parser("probar_respuesta", help="simula una respuesta con la IA local")
+    pr.add_argument("texto")
     args = p.parse_args()
+
+    if args.cmd == "probar_respuesta":
+        historial = args.texto.replace(" | ", "\n")
+        if not any(linea.strip().lower().startswith("cliente:") for linea in historial.splitlines()):
+            historial = f"Cliente: {historial}"
+        print(bandeja.simular(historial))
+        return
 
     if args.cmd == "run" and args.archivo_log:
         destino = config.PROJECT_DIR / "salida" / "bot.log"

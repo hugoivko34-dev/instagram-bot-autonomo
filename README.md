@@ -258,6 +258,10 @@ python main.py responder <ID_DEL_MENSAJE> "Tu respuesta personalizada"
 - **Cumplimiento**: usá solo esta API oficial. Herramientas que simulan ser un usuario violan los términos de Instagram y arriesgan el bloqueo.
 - No compartas el `.env` ni subas tus claves a ningún repositorio.
 
+## Respuestas automáticas con IA local
+
+También podés usar Ollama en esta computadora: configurá `IA_PROVEEDOR=local`, instalá Ollama y descargá el modelo indicado por `IA_LOCAL_MODELO` (por defecto `qwen3:4b`). El asistente usa `negocio.xlsx` como fuente de servicios, tono y preguntas frecuentes. Para cotizaciones, el código calcula el aproximado con los precios de la planilla; si la persona pide una visita o un servicio que no se cotiza, ofrece WhatsApp y te avisa por Telegram. Probá una conversación con `python main.py probar_respuesta "Cliente: ¿Cuánto sale pulir 22 m2?"`. Para usar respuestas locales, poné `MODO_SIN_IA=no`; `RESPUESTAS_AUTOMATICAS` sigue controlando si se envían o solo se guardan como sugerencia.
+
 ## 8. Estructura
 
 | Archivo | Para qué sirve |

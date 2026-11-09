@@ -5,6 +5,7 @@ import config
 import db
 import ia
 import ig_api
+import negocio
 
 SISTEMA = """Clasificás mensajes directos de Instagram para un negocio de servicios.
 Categorías:
@@ -16,6 +17,95 @@ Para "generico" escribí una respuesta breve, amable y natural (español rioplat
 Para "interes_compra" escribí una respuesta breve que agradezca y ofrezca continuar por WhatsApp (el enlace se agrega solo).
 Para "importante" dejá "respuesta" vacía.
 Devolvé: {"categoria": "...", "respuesta": "...", "resumen": "una línea para el dueño"}"""
+
+SISTEMA_LOCAL = """Sos el asistente de Instagram de {nombre}. Hablás en español rioplatense y seguís este tono: {tono}.
+Respondé corto, máximo 3 oraciones. Nunca inventes precios, plazos ni datos que no estén en la información. No des precios ni plazos de presupuesto: los agrega el sistema. No escribas números de teléfono ni links: el sistema agrega el WhatsApp. Hablale al cliente de vos.
+Usá esta información del negocio:
+{contexto}
+
+Leé toda la conversación; los m² pueden aparecer en un mensaje anterior.
+Devolvé SOLO este JSON con todas las claves: {{"intencion":"cotizar|visita|derivar|pregunta|saludo|importante","servicio":"nombre exacto de la lista o pulido o cadena vacía","terminacion":"o cadena vacía","m2": número o null,"respuesta":"...","resumen":"una línea para el dueño"}}.
+- cotizar: pide precio de un servicio cotizable. Si pregunta por pulido sin indicar hidrolaqueado o plastificado, servicio debe ser pulido. Si faltan m², preguntá cuántos aproximados son y si quiere brillante, satinado o mate, y ofrecé coordinar una visita.
+- visita: prefiere que vayamos a ver o medir.
+- derivar: servicio no cotizable (colocaciones, escaleras, reparaciones) o consulta fuera de la información.
+- pregunta: duda respondible con la información y las preguntas frecuentes.
+- saludo: saludo o agradecimiento; respondé breve y preguntá en qué podés ayudar.
+- importante: reclamo, cliente con trabajo en curso, proveedor o propuesta; respuesta vacía."""
+
+
+def _analizar_local(historial: str, texto_cliente: str = "") -> dict:
+    datos = {"intencion": "importante", "servicio": "", "terminacion": "", "m2": None,
+             "respuesta": "", "resumen": ""}
+    try:
+        contexto = negocio.contexto()
+        prompt = SISTEMA_LOCAL.format(nombre=negocio._datos.get("Nombre del negocio", "el negocio"),
+                                      tono=negocio._datos.get("Tono de las respuestas", "cordial y cercano"),
+                                      contexto=contexto)
+        r = ia.preguntar_json(prompt, f"Conversación completa:\n{historial}", 600)
+        if not isinstance(r, dict) or "intencion" not in r:
+            raise ValueError("JSON incompleto")
+        intencion = r.get("intencion")
+        if intencion not in {"cotizar", "visita", "derivar", "pregunta", "saludo", "importante"}:
+            raise ValueError("Intención inválida")
+        # servicio, terminación y m² salen primero de lo que escribió el cliente; la IA solo completa lo que falte
+        dichos = "\n".join(l.split(":", 1)[1] for l in historial.splitlines() if l.lower().startswith("cliente:"))
+        det_servicio, det_terminacion, det_m2 = negocio.detectar(dichos or historial)
+        servicio = negocio.resolver_servicio(r.get("servicio"))
+        if det_servicio and (det_servicio != "pulido" or not servicio):
+            servicio = det_servicio
+        terminacion = det_terminacion or str(r.get("terminacion") or "")
+        m2 = det_m2 or negocio.numero(r.get("m2"))
+        cot = None
+        if intencion not in {"visita", "importante"} and servicio and m2 and m2 > 0:
+            cot = negocio.cotizar(servicio, terminacion, m2)
+            if cot:
+                intencion = "cotizar"
+        numero = negocio.whatsapp()
+        if numero:  # el link lo agrega el sistema: no repetir el número suelto
+            for n in {numero, numero[3:]}:
+                r["respuesta"] = str(r.get("respuesta") or "").replace(n, "").replace(":  ", ": ")
+        if intencion == "cotizar" and m2 and m2 > 0:
+            if cot:
+                respuesta = cot + "\n\n¿Querés que coordinemos una visita para confirmarlo?"
+                categoria = "interes_compra"
+            else:
+                intencion, categoria = "derivar", "interes_compra"
+                respuesta = str(r.get("respuesta") or "¡Gracias por escribir!").strip()
+                numero = negocio.whatsapp()
+                if numero:
+                    respuesta += f"\n\nPara coordinar, escribinos por WhatsApp: https://wa.me/{numero}"
+        elif intencion in {"visita", "derivar"}:
+            categoria = "interes_compra"
+            respuesta = str(r.get("respuesta") or "¡Gracias por escribir!").strip()
+            numero = negocio.whatsapp()
+            if numero:
+                respuesta += f"\n\nPara coordinar{' la visita' if intencion == 'visita' else ''}, escribinos por WhatsApp: https://wa.me/{numero}"
+        elif intencion == "cotizar":
+            categoria = "interes_compra"
+            respuesta = str(r.get("respuesta") or "¿Cuántos m² aproximados son?").strip()
+        elif intencion in {"pregunta", "saludo"}:
+            categoria = "generico"
+            respuesta = str(r.get("respuesta") or "").strip()
+        else:
+            categoria, respuesta = "importante", ""
+        aviso = ""
+        if intencion in {"visita", "derivar"}:
+            etiqueta = "🔔 Pidió una visita" if intencion == "visita" else "🔔 Consulta para atender vos"
+            m2txt = f" · {m2:g} m²" if m2 else ""
+            aviso = f"{etiqueta}: {servicio or 'sin servicio'}{m2txt}\nCliente: {texto_cliente[:200]}\nResumen: {r.get('resumen') or ''}"
+        return {"intencion": intencion, "servicio": servicio, "m2": m2,
+                "categoria": categoria, "respuesta": respuesta, "aviso": aviso}
+    except (ValueError, TypeError, KeyError):
+        return {"intencion": "importante", "servicio": "", "m2": None,
+                "categoria": "importante", "respuesta": "", "aviso": ""}
+
+
+def simular(historial: str) -> dict:
+    if config.IA_PROVEEDOR != "local":
+        raise RuntimeError("La simulación está disponible con IA_PROVEEDOR=local")
+    texto_cliente = next((l.split(":", 1)[1].strip() for l in reversed(historial.splitlines())
+                          if l.lower().startswith("cliente:") and ":" in l), historial[:200])
+    return _analizar_local(historial, texto_cliente)
 
 
 def _avisar(texto: str) -> None:
@@ -50,6 +140,32 @@ def _parece_compra(texto: str) -> bool:
     return any(p in t for p in PALABRAS_COMPRA)
 
 
+def _pide_borrado(texto: str) -> bool:
+    t = negocio._normalizar(texto)
+    return "borrar mis datos" in t or "delete my data" in t
+
+
+def borrar_usuario(usuario: str, ig_msg_id: str) -> None:
+    """Pedido de borrado (política de privacidad): elimina todo lo del usuario y lo confirma."""
+    with db.conexion() as con:
+        ids = [r["ig_msg_id"] for r in con.execute("SELECT ig_msg_id FROM mensajes WHERE ig_usuario_id=?", (usuario,))]
+        con.executemany("DELETE FROM telegram_links WHERE ig_msg_id=?", [(i,) for i in ids])
+        con.execute("DELETE FROM mensajes WHERE ig_usuario_id=?", (usuario,))
+        # queda solo la marca del pedido, sin usuario ni texto, para no procesarlo de nuevo
+        con.execute("INSERT OR IGNORE INTO mensajes (ig_msg_id, ig_usuario_id, texto, categoria, respuesta, estado) "
+                    "VALUES (?,'','','borrado','','borrado')", (ig_msg_id,))
+    try:
+        ig_api.enviar_mensaje(usuario, "Listo, eliminamos todos tus datos de nuestros registros.")
+    except ig_api.ErrorInstagram:
+        pass
+    _avisar(f"🗑️ Un usuario pidió borrar sus datos: se eliminaron {len(ids)} mensajes guardados.")
+
+
+def borrar_antiguos(dias: int = 365) -> None:
+    with db.conexion() as con:
+        con.execute("DELETE FROM mensajes WHERE recibido < datetime('now', ?)", (f"-{dias} days",))
+
+
 def procesar() -> dict:
     mi_id = config.IG_USER_ID()
     cuentas = {"auto": 0, "pendientes": 0, "compra": 0}
@@ -63,7 +179,12 @@ def procesar() -> dict:
         usuario = ultimo["from"]["id"]
         texto = ultimo.get("message", "")
 
-        if config.MODO_SIN_IA:  # sin IA: no se responde nada; te avisa y respondés vos desde la app
+        if _pide_borrado(texto):
+            borrar_usuario(usuario, ultimo["id"])
+            continue
+
+        # la IA local solo atiende mensajes: el resto del bot puede seguir sin IA
+        if config.MODO_SIN_IA and config.IA_PROVEEDOR != "local":  # sin IA: te avisa y respondés vos desde la app
             compra = _parece_compra(texto)
             with db.conexion() as con:
                 con.execute("INSERT INTO mensajes (ig_msg_id, ig_usuario_id, texto, categoria, respuesta, estado) "
@@ -76,6 +197,38 @@ def procesar() -> dict:
 
         historial = "\n".join(f"{'Yo' if m['from']['id'] == mi_id else 'Cliente'}: {m.get('message', '')}"
                               for m in reversed(mensajes))
+        if config.IA_PROVEEDOR == "local":
+            try:
+                analisis = simular(historial)
+            except RuntimeError as e:
+                _avisar(str(e))
+                with db.conexion() as con:
+                    con.execute("INSERT INTO mensajes (ig_msg_id, ig_usuario_id, texto, categoria, respuesta, estado) "
+                                "VALUES (?,?,?,?,?,?)",
+                                (ultimo["id"], usuario, texto, "importante", "", "pendiente_humano"))
+                _notificar_dm(ultimo["id"], usuario, texto, "importante")
+                cuentas["pendientes"] += 1
+                continue
+            categoria, respuesta = analisis["categoria"], analisis["respuesta"]
+            if analisis["aviso"]:
+                _avisar(analisis["aviso"])
+            estado = "pendiente_humano"
+            if categoria == "interes_compra":
+                cuentas["compra"] += 1
+            elif categoria == "importante":
+                cuentas["pendientes"] += 1
+            if respuesta and config.RESPUESTAS_AUTOMATICAS:
+                try:
+                    ig_api.enviar_mensaje(usuario, respuesta)
+                    estado = "respondido_auto"
+                    cuentas["auto"] += 1
+                except ig_api.ErrorInstagram as e:
+                    _avisar(f"No pude responder a {usuario}: {e}")
+            with db.conexion() as con:
+                con.execute("INSERT INTO mensajes (ig_msg_id, ig_usuario_id, texto, categoria, respuesta, estado) VALUES (?,?,?,?,?,?)",
+                            (ultimo["id"], usuario, texto, categoria, respuesta, estado))
+            _notificar_dm(ultimo["id"], usuario, texto, categoria)
+            continue
         r = ia.preguntar_json(SISTEMA + f"\nNegocio: {config.DESCRIPCION_NEGOCIO}", f"Conversación:\n{historial}", 600)
         categoria, respuesta = r["categoria"], (r.get("respuesta") or "").strip()
         estado = "pendiente_humano"

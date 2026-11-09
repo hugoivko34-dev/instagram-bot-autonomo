@@ -32,6 +32,9 @@ ID_MENSAJES = lambda: _req("IG_USER_ID") if INSTAGRAM_API_MODE == "instagram_log
 # --- Claude (para generar contenido y clasificar mensajes) ---
 ANTHROPIC_KEY = lambda: _req("ANTHROPIC_API_KEY")
 MODELO = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5")
+IA_PROVEEDOR = os.getenv("IA_PROVEEDOR", "claude").lower()
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+IA_LOCAL_MODELO = os.getenv("IA_LOCAL_MODELO", "qwen3:4b")
 
 # --- Modo sin IA: no hace falta clave de Anthropic. Los textos salen de plantillas y de tus notas,
 #     y los mensajes te llegan como aviso para que respondas vos desde la app de Instagram. ---
